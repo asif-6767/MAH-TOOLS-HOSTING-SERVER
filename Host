@@ -1,0 +1,422 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+# ============================================================
+# TOOL NAME:  ALIF HOST PRO
+# AUTHOR:     ALIF ISLAM
+# VERSION:    1.0
+# DESCRIPTION: Professional Termux CLI tool to expose localhost
+#              using multiple tunneling services with hacker-style UI.
+# ============================================================
+
+set -euo pipefail
+
+# ------------------------------
+# COLOR & STYLE DEFINITIONS
+# ------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+CLEAR='\033[2J\033[H'
+
+# ------------------------------
+# GLOBAL VARIABLES
+# ------------------------------
+PORT=""
+SERVER_PID=""
+declare -a TUNNEL_PIDS=()
+LOG_DIR="$HOME/.alifhostpro/logs"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+CLOUDFLARED_LOG="$LOG_DIR/cloudflared_${TIMESTAMP}.log"
+SERVEO_LOG="$LOG_DIR/serveo_${TIMESTAMP}.log"
+LOCALHOSTRUN_LOG="$LOG_DIR/localhostrun_${TIMESTAMP}.log"
+TUNNELMOLE_LOG="$LOG_DIR/tunnelmole_${TIMESTAMP}.log"
+
+# ------------------------------
+# UTILITY FUNCTIONS
+# ------------------------------
+function cleanup() {
+    echo -e "\n${YELLOW}[!] Stopping all tunnels and servers...${NC}"
+    # Kill all background tunnel processes
+    for pid in "${TUNNEL_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    # Kill local server if started
+    if [[ -n "$SERVER_PID" ]]; then
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
+    # Extra cleanup: kill any remaining cloudflared/ssh/tunnelmole
+    pkill -f "cloudflared" 2>/dev/null || true
+    pkill -f "serveo.net" 2>/dev/null || true
+    pkill -f "localhost.run" 2>/dev/null || true
+    pkill -f "tunnelmole" 2>/dev/null || true
+    echo -e "${GREEN}[✓] Cleanup completed. Exiting.${NC}"
+    exit 0
+}
+
+function show_banner() {
+    echo -e "${CYAN}${BOLD}"
+    echo "   ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄ "
+    echo "  ▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌"
+    echo "  ▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌"
+    echo "  ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌       ▐░▌▐░▌       ▐░▌"
+    echo "  ▐░█▄▄▄▄▄▄▄█░▌▐░█▄▄▄▄▄▄▄█░▌▐░▌       ▐░▌▐░▌       ▐░▌"
+    echo "  ▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌▐░▌       ▐░▌▐░▌       ▐░▌"
+    echo "  ▐░█▀▀▀▀▀▀▀█░▌▐░█▀▀▀▀▀▀▀█░▌▐░▌       ▐░▌▐░▌       ▐░▌"
+    echo "  ▐░▌       ▐░▌▐░▌       ▐░▌▐░▌       ▐░▌▐░▌       ▐░▌"
+    echo "  ▐░▌       ▐░▌▐░▌       ▐░▌▐░█▄▄▄▄▄▄▄█░▌▐░█▄▄▄▄▄▄▄█░▌"
+    echo "  ▐░▌       ▐░▌▐░▌       ▐░▌▐░░░░░░░░░░░▌▐░░░░░░░░░░░▌"
+    echo "   ▀         ▀  ▀         ▀  ▀▀▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀▀▀ "
+    echo -e "${NC}"
+    echo -e "${MAGENTA}${BOLD}             TOOLS BY ALIF ISLAM${NC}"
+    echo -e "${DIM}        Advanced Multi-Tunneling Suite for Termux${NC}\n"
+}
+
+function loading_animation() {
+    local pid=$1
+    local delay=0.5
+    local spinstr='|/-\'
+    while kill -0 "$pid" 2>/dev/null; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+function check_dependency() {
+    if ! command -v "$1" &>/dev/null; then
+        echo -e "${YELLOW}[!] $1 not found. Installing...${NC}"
+        pkg install "$2" -y
+        if ! command -v "$1" &>/dev/null; then
+            echo -e "${RED}[✗] Failed to install $1. Please check your connection.${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}[✓] $1 installed successfully.${NC}"
+    else
+        echo -e "${GREEN}[✓] $1 found.${NC}"
+    fi
+}
+
+function install_dependencies() {
+    echo -e "${CYAN}[*] Checking and installing required packages...${NC}"
+    pkg update -y
+    check_dependency "php" "php"
+    check_dependency "ssh" "openssh"
+    check_dependency "node" "nodejs"
+    check_dependency "npm" "nodejs"
+    check_dependency "cloudflared" "cloudflared"
+    
+    if ! command -v "tunnelmole" &>/dev/null; then
+        echo -e "${YELLOW}[!] tunnelmole not found. Installing via npm...${NC}"
+        npm install -g tunnelmole
+        if ! command -v "tunnelmole" &>/dev/null; then
+            echo -e "${RED}[✗] Failed to install tunnelmole.${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}[✓] tunnelmole installed.${NC}"
+    else
+        echo -e "${GREEN}[✓] tunnelmole found.${NC}"
+    fi
+    
+    # Optional: qrencode for QR codes, termux-clipboard-set for clipboard
+    if ! command -v "qrencode" &>/dev/null; then
+        echo -e "${YELLOW}[!] qrencode not found (optional). Installing...${NC}"
+        pkg install qrencode -y || true
+    fi
+    if ! command -v "termux-clipboard-set" &>/dev/null; then
+        echo -e "${YELLOW}[!] termux-clipboard-set not found (optional). Install termux-api for clipboard support.${NC}"
+    fi
+    echo -e "${GREEN}[✓] All core dependencies satisfied.${NC}\n"
+}
+
+function start_local_server() {
+    local mode=$1
+    local folder=$2
+    echo -e "${CYAN}[*] Starting local server on port $PORT...${NC}"
+    if [[ "$mode" == "php" ]]; then
+        php -S 0.0.0.0:"$PORT" -t "$folder" &>/dev/null &
+        SERVER_PID=$!
+        echo -e "${GREEN}[✓] PHP server started (PID: $SERVER_PID) serving $folder${NC}"
+    elif [[ "$mode" == "python" ]]; then
+        python3 -m http.server "$PORT" --directory "$folder" &>/dev/null &
+        SERVER_PID=$!
+        echo -e "${GREEN}[✓] Python HTTP server started (PID: $SERVER_PID) serving $folder${NC}"
+    else
+        echo -e "${YELLOW}[!] No local server started - assuming an existing server on port $PORT${NC}"
+        return
+    fi
+    sleep 2
+    # Verify server is actually listening
+    if ! ss -tln | grep -q ":$PORT "; then
+        echo -e "${RED}[✗] Local server failed to start. Check port availability.${NC}"
+        exit 1
+    fi
+}
+
+function extract_url_from_log() {
+    local logfile=$1
+    local service=$2
+    local url=""
+    # Timeout after 30 seconds
+    local timeout=30
+    local elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        if [[ -f "$logfile" ]]; then
+            case $service in
+                cloudflared)
+                    url=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "$logfile" | head -1)
+                    ;;
+                serveo)
+                    url=$(grep -oP 'https://[a-zA-Z0-9.-]+\.serveo\.net' "$logfile" | head -1)
+                    ;;
+                localhostrun)
+                    url=$(grep -oP 'https://[a-zA-Z0-9.-]+\.localhost\.run' "$logfile" | head -1)
+                    ;;
+                tunnelmole)
+                    url=$(grep -oP 'https://[a-zA-Z0-9.-]+\.tunnelmole\.com' "$logfile" | head -1)
+                    ;;
+            esac
+            if [[ -n "$url" ]]; then
+                echo "$url"
+                return 0
+            fi
+        fi
+        sleep 1
+        elapsed=$((elapsed+1))
+    done
+    return 1
+}
+
+function start_tunnels() {
+    echo -e "${CYAN}[*] Launching tunnel services in background...${NC}"
+    mkdir -p "$LOG_DIR"
+    
+    # Cloudflared
+    echo -ne "${YELLOW}[→] Starting Cloudflare Tunnel... ${NC}"
+    cloudflared tunnel --url "localhost:$PORT" &> "$CLOUDFLARED_LOG" &
+    CLOUDFLARED_PID=$!
+    TUNNEL_PIDS+=($CLOUDFLARED_PID)
+    echo -e "${GREEN}DONE (PID: $CLOUDFLARED_PID)${NC}"
+    
+    # Serveo
+    echo -ne "${YELLOW}[→] Starting Serveo Tunnel... ${NC}"
+    ssh -o StrictHostKeyChecking=no -R 80:"localhost":"$PORT" serveo.net &> "$SERVEO_LOG" &
+    SERVEO_PID=$!
+    TUNNEL_PIDS+=($SERVEO_PID)
+    echo -e "${GREEN}DONE (PID: $SERVEO_PID)${NC}"
+    
+    # Localhost.run
+    echo -ne "${YELLOW}[→] Starting Localhost.run Tunnel... ${NC}"
+    ssh -o StrictHostKeyChecking=no -R 80:"localhost":"$PORT" localhost.run &> "$LOCALHOSTRUN_LOG" &
+    LOCALHOSTRUN_PID=$!
+    TUNNEL_PIDS+=($LOCALHOSTRUN_PID)
+    echo -e "${GREEN}DONE (PID: $LOCALHOSTRUN_PID)${NC}"
+    
+    # Tunnelmole
+    echo -ne "${YELLOW}[→] Starting Tunnelmole... ${NC}"
+    tunnelmole --port "$PORT" &> "$TUNNELMOLE_LOG" &
+    TUNNELMOLE_PID=$!
+    TUNNEL_PIDS+=($TUNNELMOLE_PID)
+    echo -e "${GREEN}DONE (PID: $TUNNELMOLE_PID)${NC}"
+    
+    echo -e "\n${CYAN}[*] Waiting for URLs to be generated...${NC}"
+    sleep 3
+}
+
+function display_urls() {
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${GREEN}                     GENERATED PUBLIC URLs                         ${NC}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════════════${NC}\n"
+    
+    # Cloudflared
+    echo -ne "${YELLOW}[1] Cloudflare Tunnel:${NC} "
+    CLOUD_URL=$(extract_url_from_log "$CLOUDFLARED_LOG" "cloudflared")
+    if [[ -n "$CLOUD_URL" ]]; then
+        echo -e "${GREEN}✓${NC} ${CYAN}$CLOUD_URL${NC}"
+    else
+        echo -e "${RED}✗ Failed to obtain URL${NC}"
+    fi
+    
+    # Serveo
+    echo -ne "${YELLOW}[2] Serveo:${NC} "
+    SERVEO_URL=$(extract_url_from_log "$SERVEO_LOG" "serveo")
+    if [[ -n "$SERVEO_URL" ]]; then
+        echo -e "${GREEN}✓${NC} ${CYAN}$SERVEO_URL${NC}"
+    else
+        echo -e "${RED}✗ Failed to obtain URL${NC}"
+    fi
+    
+    # Localhost.run
+    echo -ne "${YELLOW}[3] Localhost.run:${NC} "
+    LOCALRUN_URL=$(extract_url_from_log "$LOCALHOSTRUN_LOG" "localhostrun")
+    if [[ -n "$LOCALRUN_URL" ]]; then
+        echo -e "${GREEN}✓${NC} ${CYAN}$LOCALRUN_URL${NC}"
+    else
+        echo -e "${RED}✗ Failed to obtain URL${NC}"
+    fi
+    
+    # Tunnelmole
+    echo -ne "${YELLOW}[4] Tunnelmole:${NC} "
+    TUNNELMOLE_URL=$(extract_url_from_log "$TUNNELMOLE_LOG" "tunnelmole")
+    if [[ -n "$TUNNELMOLE_URL" ]]; then
+        echo -e "${GREEN}✓${NC} ${CYAN}$TUNNELMOLE_URL${NC}"
+    else
+        echo -e "${RED}✗ Failed to obtain URL${NC}"
+    fi
+    
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════════════════${NC}"
+    
+    # Store URLs in array for later use
+    ALL_URLS=("$CLOUD_URL" "$SERVEO_URL" "$LOCALRUN_URL" "$TUNNELMOLE_URL")
+}
+
+function copy_to_clipboard() {
+    local url=$1
+    if command -v termux-clipboard-set &>/dev/null; then
+        echo -n "$url" | termux-clipboard-set
+        echo -e "${GREEN}[✓] URL copied to clipboard!${NC}"
+    else
+        echo -e "${YELLOW}[!] termux-clipboard-set not available. Install termux-api for clipboard support.${NC}"
+    fi
+}
+
+function generate_qr() {
+    local url=$1
+    if command -v qrencode &>/dev/null; then
+        echo -e "${CYAN}[*] Generating QR code...${NC}"
+        qrencode -t UTF8 "$url"
+    else
+        echo -e "${YELLOW}[!] qrencode not installed. Cannot generate QR code.${NC}"
+    fi
+}
+
+function interactive_menu() {
+    local choice
+    echo -e "\n${BOLD}${MAGENTA}┌─────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${MAGENTA}│           ADDITIONAL OPTIONS              │${NC}"
+    echo -e "${BOLD}${MAGENTA}└─────────────────────────────────────────┘${NC}"
+    echo -e "${CYAN}[1] Copy a URL to clipboard${NC}"
+    echo -e "${CYAN}[2] Generate QR code for a URL${NC}"
+    echo -e "${CYAN}[3] Show live tunnel logs${NC}"
+    echo -e "${CYAN}[4] Keep running (press Ctrl+C to stop)${NC}"
+    echo -ne "${YELLOW}Select option: ${NC}"
+    read -r choice
+    
+    case $choice in
+        1)
+            echo -ne "${YELLOW}Enter URL number (1-4): ${NC}"
+            read -r num
+            if [[ $num =~ ^[1-4]$ ]] && [[ -n "${ALL_URLS[$((num-1))]}" ]]; then
+                copy_to_clipboard "${ALL_URLS[$((num-1))]}"
+            else
+                echo -e "${RED}Invalid selection or URL not available.${NC}"
+            fi
+            ;;
+        2)
+            echo -ne "${YELLOW}Enter URL number (1-4): ${NC}"
+            read -r num
+            if [[ $num =~ ^[1-4]$ ]] && [[ -n "${ALL_URLS[$((num-1))]}" ]]; then
+                generate_qr "${ALL_URLS[$((num-1))]}"
+            else
+                echo -e "${RED}Invalid selection or URL not available.${NC}"
+            fi
+            ;;
+        3)
+            echo -e "${CYAN}[*] Showing last 10 lines of each tunnel log (Ctrl+C to return)...${NC}"
+            for log in "$CLOUDFLARED_LOG" "$SERVEO_LOG" "$LOCALHOSTRUN_LOG" "$TUNNELMOLE_LOG"; do
+                echo -e "\n${YELLOW}=== $(basename "$log") ===${NC}"
+                tail -10 "$log" 2>/dev/null || echo "No log data"
+            done
+            echo -e "\n${CYAN}Press Enter to continue...${NC}"
+            read -r
+            ;;
+        4|*)
+            echo -e "${GREEN}[*] All tunnels are active. Press Ctrl+C to stop.${NC}"
+            while true; do sleep 1; done
+            ;;
+    esac
+}
+
+# ------------------------------
+# MAIN EXECUTION FLOW
+# ------------------------------
+trap cleanup SIGINT SIGTERM EXIT
+
+# Initial setup
+clear
+show_banner
+install_dependencies
+
+# Get port from user
+while true; do
+    echo -ne "${CYAN}[?] Enter localhost port number (e.g., 8080): ${NC}"
+    read -r PORT
+    if [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; then
+        break
+    else
+        echo -e "${RED}[!] Invalid port. Use a number between 1024 and 65535.${NC}"
+    fi
+done
+
+# Server start options
+echo -e "\n${BOLD}${MAGENTA}┌─────────────────────────────────────────┐${NC}"
+echo -e "${BOLD}${MAGENTA}│           LOCAL SERVER OPTIONS            │${NC}"
+echo -e "${BOLD}${MAGENTA}└─────────────────────────────────────────┘${NC}"
+echo -e "${CYAN}[1] Start PHP server (serves current directory)${NC}"
+echo -e "${CYAN}[2] Start PHP server (choose folder)${NC}"
+echo -e "${CYAN}[3] Start Python HTTP server (choose folder)${NC}"
+echo -e "${CYAN}[4] Assume server already running on port $PORT${NC}"
+echo -ne "${YELLOW}Select option: ${NC}"
+read -r server_opt
+
+case $server_opt in
+    1)
+        start_local_server "php" "$(pwd)"
+        ;;
+    2)
+        echo -ne "${CYAN}[?] Enter folder path (absolute or relative): ${NC}"
+        read -r folder
+        folder=$(realpath "$folder" 2>/dev/null || echo "$folder")
+        if [[ -d "$folder" ]]; then
+            start_local_server "php" "$folder"
+        else
+            echo -e "${RED}[✗] Invalid folder. Using current directory.${NC}"
+            start_local_server "php" "$(pwd)"
+        fi
+        ;;
+    3)
+        echo -ne "${CYAN}[?] Enter folder path (absolute or relative): ${NC}"
+        read -r folder
+        folder=$(realpath "$folder" 2>/dev/null || echo "$folder")
+        if [[ -d "$folder" ]]; then
+            start_local_server "python" "$folder"
+        else
+            echo -e "${RED}[✗] Invalid folder. Using current directory.${NC}"
+            start_local_server "python" "$(pwd)"
+        fi
+        ;;
+    4)
+        echo -e "${YELLOW}[!] Assuming server is already running on port $PORT${NC}"
+        ;;
+    *)
+        echo -e "${RED}[!] Invalid option. Assuming existing server.${NC}"
+        ;;
+esac
+
+# Launch tunnels
+start_tunnels
+display_urls
+
+# Interactive menu loop
+while true; do
+    interactive_menu
+done
+
+# Cleanup is handled by trap
